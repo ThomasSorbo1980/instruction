@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drop a PDF → Get Processed Output</title>
+<style>
+  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  body { margin: 0; background:#0f172a; color:#e5e7eb; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  .card { background:#111827; border:1px solid #1f2937; border-radius:16px; padding:28px; max-width:720px; width:94%; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+  h1 { margin: 0 0 10px; font-size: 20px; }
+  p { opacity:.8; }
+  .drop { margin-top:16px; border:2px dashed #334155; border-radius:12px; padding:34px; text-align:center; transition: all .2s ease; background:#0b1220; }
+  .drop.dragover { border-color:#60a5fa; background:#0b1930; }
+  .btn { display:inline-block; margin-top:10px; padding:10px 14px; border-radius:10px; border:1px solid #334155; background:#1f2937; color:#e5e7eb; cursor:pointer; }
+  .btn:hover { background:#273244; }
+  #status { margin-top:12px; font-size:14px; opacity:.9; }
+  #result { margin-top:16px; display:none; }
+  .link { color:#93c5fd; text-decoration:none; }
+  .link:hover { text-decoration:underline; }
+  input[type=file] { display:none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Drag & drop a PDF</h1>
+    <p>This will upload the file, extract + normalize data with AI, and return a processed file.</p>
+
+    <div id="drop" class="drop">
+      <p>Drop your <strong>.pdf</strong> here</p>
+      <label class="btn">
+        Or choose a file
+        <input id="file" type="file" accept="application/pdf">
+      </label>
+    </div>
+
+    <div id="status"></div>
+    <div id="result">
+      <p>✅ Done. <a id="download" class="link" href="#" download>Download result</a></p>
+    </div>
+  </div>
+
+<script>
+const drop = document.getElementById('drop');
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+const downloadEl = document.getElementById('download');
+const fileInput = document.getElementById('file');
+
+function setStatus(msg){ statusEl.textContent = msg; }
+function setDrag(on){ drop.classList.toggle('dragover', !!on); }
+
+drop.addEventListener('dragover', e => { e.preventDefault(); setDrag(true); });
+drop.addEventListener('dragleave', e => { setDrag(false); });
+drop.addEventListener('drop', async e => {
+  e.preventDefault(); setDrag(false);
+  const file = e.dataTransfer.files[0];
+  if(!file) return;
+  await upload(file);
+});
+
+fileInput.addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if(!file) return;
+  await upload(file);
+});
+
+async function upload(file){
+  if(!file.name.toLowerCase().endsWith('.pdf')){
+    setStatus('Please choose a .pdf file');
+    return;
+  }
+  setStatus('Uploading and processing...');
+  resultEl.style.display = 'none';
+  try{
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/upload', { method:'POST', body: fd });
+    if(!res.ok){
+      const t = await res.text();
+      throw new Error('Server error: ' + t);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    downloadEl.href = url;
+    downloadEl.download = file.name.replace('.pdf','_processed.json'); // change to .pdf after Doc Gen
+    resultEl.style.display = 'block';
+    setStatus('');
+  }catch(err){
+    console.error(err);
+    setStatus('Error: ' + err.message);
+  }
+}
+</script>
+</body>
+</html>
