@@ -138,18 +138,18 @@ def adobe_extract_start(asset_id: str) -> str:
         raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
 
-def adobe_docgen_start(template_asset_id: str, data_asset_id: str = None, inline_json: dict = None) -> str:
+def adobe_docgen_start(template_asset_id: str, inline_json: dict) -> str:
     url = f"{ADOBE_HOST}/operation/documentgeneration"
-    if inline_json is not None:
-        body = {"assetID": template_asset_id, "jsonData": inline_json, "outputFormat": "pdf"}
-    elif data_asset_id is not None:
-        body = {"assetID": template_asset_id, "jsonDataAssetID": data_asset_id, "outputFormat": "pdf"}
-    else:
-        raise RuntimeError("adobe_docgen_start: provide inline_json or data_asset_id")
+    body = {
+        "assetID": template_asset_id,
+        "outputFormat": "pdf",              # "pdf" per REST example (SDK uses OutputFormat.PDF)
+        "jsonDataForMerge": inline_json     # <-- this is the correct key
+    }
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
         raise RuntimeError(f"DocGen start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
+
 
 def adobe_poll_job(location_url: str, interval_s=2, timeout_s=900) -> dict:
     end = time.time() + timeout_s
@@ -216,19 +216,24 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
     return str(p)
 
 def run_docgen_inline(template_path: str, data_json_path: str, work_prefix: str) -> str:
-    # Upload template
+    # Upload template DOCX
     t = adobe_assets_create("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with open(template_path, "rb") as tf:
         adobe_put_upload(t["uploadUri"], tf.read(),
                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    # Inline JSON
+
+    # Load your normalized JSON
     with open(data_json_path, "r", encoding="utf-8") as jf:
         data_obj = json.load(jf)
+
+    # Start DocGen with the *correct* inline key
     loc = adobe_docgen_start(template_asset_id=t["assetID"], inline_json=data_obj)
     info = adobe_poll_job(loc)
+
     pdf_url = _find_download_url(info)
     if not pdf_url:
         raise RuntimeError("No downloadUri from DocGen job")
+
     out_pdf = f"{work_prefix}_filled.pdf"
     with requests.get(pdf_url, stream=True, timeout=300) as r:
         r.raise_for_status()
@@ -236,6 +241,7 @@ def run_docgen_inline(template_path: str, data_json_path: str, work_prefix: str)
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
     return out_pdf
+
 
 # ---------------------------
 # Background job machinery
