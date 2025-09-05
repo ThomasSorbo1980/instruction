@@ -124,31 +124,99 @@ def download_to(url: str, out_path: str):
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
+def _find_download_url(obj):
+    """Recursively search for a 'downloadUri' anywhere in the job response."""
+    if isinstance(obj, dict):
+        if "downloadUri" in obj and obj["downloadUri"]:
+            return obj["downloadUri"]
+        for v in obj.values():
+            url = _find_download_url(v)
+            if url:
+                return url
+    elif isinstance(obj, list):
+        for v in obj:
+            url = _find_download_url(v)
+            if url:
+                return url
+    return None
+
+def adobe_asset_get(asset_id: str) -> dict:
+    """Fetch metadata for an asset; some responses give assetID instead of a direct downloadUri."""
+    url = f"{ADOBE_HOST}/assets/{asset_id}"
+    r = requests.get(url, headers=_h_auth(), timeout=60)
+    r.raise_for_status()
+    return r.json()  # often includes downloadUri or a list of representations
 
 def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
-    """Extract pipeline → returns path to structuredData.json."""
-    # /assets + PUT (PDF)
+    """Extract pipeline → returns path to structuredData.json, handling multiple response shapes."""
+    # 1) Create asset & upload PDF
     a = adobe_assets_create("application/pdf")
     adobe_put_upload(a["uploadUri"], pdf_bytes, "application/pdf")
-    # start extract
+
+    # 2) Start extract
     loc = adobe_extract_start(a["assetID"])
+
+    # 3) Poll until done
     info = adobe_poll_job(loc)
-    zip_url = info.get("downloadUri")
+
+    # 4) Find a download URL in various response shapes
+    zip_url = _find_download_url(info)
     if not zip_url:
+        # Some responses provide an assetID instead of downloadUri
+        # Try a few likely places:
+        asset_ids = []
+        for key in ("assetID", "result", "assets", "outputs", "output"):
+            node = info.get(key)
+            if isinstance(node, str):
+                asset_ids.append(node)
+            elif isinstance(node, dict) and "assetID" in node:
+                asset_ids.append(node["assetID"])
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, dict) and "assetID" in item:
+                        asset_ids.append(item["assetID"])
+        # Query assets for a downloadUri
+        for aid in asset_ids:
+            try:
+                meta = adobe_asset_get(aid)
+                zip_url = _find_download_url(meta)
+                if zip_url:
+                    break
+            except Exception:
+                pass
+
+    if not zip_url:
+        # Log the job info to help debugging (won't expose to client)
+        print("Adobe Extract job info (no downloadUri found):", json.dumps(info, indent=2)[:5000])
         raise RuntimeError("No downloadUri from Extract job")
+
+    # 5) Download ZIP
     out_zip = f"{work_prefix}_extract.zip"
     download_to(zip_url, out_zip)
-    # unzip and locate structuredData.json
+
+    # 6) Unzip and locate structuredData.json
     out_dir = f"{work_prefix}_extract"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_zip, "r") as z:
         z.extractall(out_dir)
+
+    # structuredData.json might be at root or under /json/
     p = Path(out_dir, "structuredData.json")
     if not p.exists():
         alt = Path(out_dir, "json", "structuredData.json")
-        if alt.exists(): p = alt
-        else: raise RuntimeError("structuredData.json not found in Extract ZIP")
+        if alt.exists():
+            p = alt
+        else:
+            # As a last resort, search the whole tree
+            for candidate in Path(out_dir).rglob("structuredData.json"):
+                p = candidate
+                break
+            if not p.exists():
+                # Debug list files to logs
+                print("Extracted files:", [str(x) for x in Path(out_dir).rglob("*")][:200])
+                raise RuntimeError("structuredData.json not found in Extract ZIP")
     return str(p)
+
 
 def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str:
     """Document Generation pipeline → returns path to final PDF."""
