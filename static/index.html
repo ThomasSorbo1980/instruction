@@ -1,124 +1,398 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Instruction PDF Processor</title>
+  <meta charset="UTF-8" />
+  <title>Shipping Instruction – Extract & Edit</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: sans-serif; margin: 40px; background: #f7f7f7; }
-    h1 { font-size: 1.4em; }
-    #dropzone {
-      border: 3px dashed #999;
-      border-radius: 12px;
-      padding: 50px;
-      text-align: center;
-      background: white;
-      color: #666;
-      cursor: pointer;
+    :root{
+      --bg:#f7f7f7;--card:#fff;--ink:#222;--muted:#666;--primary:#2563eb;--border:#ddd;
     }
-    #dropzone.dragover { border-color: #007BFF; color: #007BFF; }
-    #status { margin-top: 20px; font-size: 1.1em; }
+    *{box-sizing:border-box}
+    body{margin:0;padding:32px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+    h1{font-size:20px;margin:0 0 16px}
+    .row{display:flex;gap:24px;flex-wrap:wrap}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,.04);padding:18px}
+    #drop{flex:1;min-width:280px;text-align:center;border:2px dashed var(--border);border-radius:14px;padding:32px;background:#fff;color:var(--muted);cursor:pointer}
+    #drop.dragover{border-color:var(--primary);color:var(--primary)}
+    #status{margin-top:12px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(250px,1fr));gap:12px}
+    .section{margin-top:18px}
+    .section h2{font-size:16px;margin:8px 0 12px}
+    label{font-size:12px;color:#444;display:block;margin:6px 0 4px}
+    input[type="text"], textarea, select{
+      width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:#fff;font:inherit
+    }
+    textarea{min-height:80px;resize:vertical}
+    .rowline{display:flex;gap:8px}
+    .btn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:#fff;padding:10px 14px;border-radius:10px;cursor:pointer}
+    .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+    .btnbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+    .pill{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:6px 10px;font-size:12px;border:1px solid #e0e7ff}
+    .list{display:flex;flex-direction:column;gap:6px}
+    .inline{display:flex;gap:8px;align-items:center}
+    .small{font-size:12px;color:var(--muted)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;background:#0b1021;color:#cde3ff;padding:10px;border-radius:10px;overflow:auto;max-height:220px}
+    .hr{height:1px;background:var(--border);margin:14px 0}
   </style>
 </head>
 <body>
-  <h1>Upload your Shipping Instruction PDF</h1>
+  <h1>Shipping Instruction – Extract & Edit</h1>
 
-  <div id="dropzone">Drop PDF here or click to select</div>
-  <input type="file" id="fileInput" accept="application/pdf" style="display:none;" />
+  <div class="row">
+    <div id="drop" class="card" tabindex="0" role="button">
+      <strong>Drop PDF here</strong><br/>
+      or click to select
+      <div id="status">Idle</div>
+      <input id="file" type="file" accept="application/pdf" hidden />
+    </div>
 
-  <div id="status">Idle</div>
+    <div class="card" style="min-width:280px;max-width:420px">
+      <div class="section">
+        <h2>Result Controls</h2>
+        <div class="btnbar">
+          <button id="downloadJson" class="btn" disabled>⬇️ Download JSON</button>
+          <button id="copyJson" class="btn" disabled>📋 Copy JSON</button>
+        </div>
+        <div class="section">
+          <label for="webhook">Optional webhook URL</label>
+          <input id="webhook" type="text" placeholder="https://example.com/endpoint" />
+          <div class="btnbar">
+            <button id="sendWebhook" class="btn" disabled>📤 Send JSON to webhook</button>
+          </div>
+          <div class="small">We’ll POST the edited JSON to your URL.</div>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div class="section">
+        <h2>Debug</h2>
+        <div class="small">Last job id:</div>
+        <div id="jobid" class="pill">–</div>
+        <div class="small" style="margin-top:8px">Raw JSON (preview)</div>
+        <pre id="preview" class="mono">–</pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="formWrap" class="card section" style="margin-top:16px; display:none">
+    <h2>Form</h2>
+
+    <!-- Parties -->
+    <div class="section">
+      <h2>Parties</h2>
+      <div class="grid">
+        <div>
+          <h3 class="small">Shipper</h3>
+          <label>Name</label><input id="shipper.name" type="text" />
+          <label>Address</label><textarea id="shipper.address"></textarea>
+          <label>Contact</label><input id="shipper.contact" type="text" />
+          <label>Email</label><input id="shipper.email" type="text" />
+          <label>Phone</label><input id="shipper.phone" type="text" />
+          <label>VAT</label><input id="shipper.vat" type="text" />
+        </div>
+        <div>
+          <h3 class="small">Consignee</h3>
+          <label>Name</label><input id="consignee.name" type="text" />
+          <label>Address</label><textarea id="consignee.address"></textarea>
+          <label>VAT</label><input id="consignee.vat" type="text" />
+          <h3 class="small" style="margin-top:12px">Notify</h3>
+          <label>Name</label><input id="notify.name" type="text" />
+          <label>Address</label><textarea id="notify.address"></textarea>
+          <label>Email</label><input id="notify.email" type="text" />
+          <label>Phone</label><input id="notify.phone" type="text" />
+        </div>
+      </div>
+    </div>
+
+    <!-- References -->
+    <div class="section">
+      <h2>References</h2>
+      <div class="grid">
+        <div><label>Shipment No</label><input id="refs.shipment_no" type="text" /></div>
+        <div><label>Order No (Internal)</label><input id="refs.order_no_internal" type="text" /></div>
+        <div><label>Customer PO</label><input id="refs.customer_po" type="text" /></div>
+        <div><label>Delivery No</label><input id="refs.delivery_no" type="text" /></div>
+        <div><label>Customer No</label><input id="refs.customer_no" type="text" /></div>
+        <div><label>Loading Date</label><input id="refs.loading_date" type="text" placeholder="YYYY-MM-DD" /></div>
+        <div><label>Scheduled Delivery Date</label><input id="refs.scheduled_delivery_date" type="text" placeholder="YYYY-MM-DD" /></div>
+      </div>
+    </div>
+
+    <!-- Shipping -->
+    <div class="section">
+      <h2>Shipping</h2>
+      <div class="grid">
+        <div><label>Shipping Point</label><input id="shipping.shipping_point" type="text" /></div>
+        <div><label>Incoterms</label>
+          <select id="shipping.incoterms">
+            <option value=""></option>
+            <option>EXW</option><option>FCA</option><option>CPT</option><option>CIP</option>
+            <option>DAP</option><option>DPU</option><option>DDP</option>
+            <option>FAS</option><option>FOB</option><option>CFR</option><option>CIF</option>
+          </select>
+        </div>
+        <div><label>Way of Forwarding</label><input id="shipping.way_of_forwarding" type="text" /></div>
+        <div><label>POL (Port of Loading)</label><input id="shipping.pol" type="text" /></div>
+        <div><label>POD (Port of Discharge)</label><input id="shipping.pod" type="text" /></div>
+      </div>
+    </div>
+
+    <!-- Cargo -->
+    <div class="section">
+      <h2>Cargo</h2>
+      <div class="grid">
+        <div><label>Description</label><textarea id="cargo.description"></textarea></div>
+        <div>
+          <label>Packaging (list)</label>
+          <div id="packList" class="list"></div>
+          <div class="inline">
+            <input id="newPack" type="text" placeholder="e.g. 4 pallets" />
+            <button class="btn" type="button" id="addPack">＋ Add</button>
+          </div>
+        </div>
+        <div><label>Net Weight (kg)</label><input id="cargo.net_kg" type="text" /></div>
+        <div><label>Gross Weight (kg)</label><input id="cargo.gross_kg" type="text" /></div>
+      </div>
+    </div>
+
+    <!-- Marks / BL -->
+    <div class="section">
+      <h2>Marks & Bill of Lading</h2>
+      <div class="grid">
+        <div><label>Carton Marks</label><textarea id="marks.carton_marks"></textarea></div>
+        <div><label>Labelling</label><textarea id="marks.labelling"></textarea></div>
+        <div><label>B/L Type</label><input id="bl.type" type="text" placeholder="e.g. Seaway Bill" /></div>
+      </div>
+    </div>
+
+    <div class="btnbar">
+      <button id="downloadJson2" class="btn">⬇️ Download JSON</button>
+      <button id="copyJson2" class="btn">📋 Copy JSON</button>
+    </div>
+  </div>
 
   <script>
-    const dropzone = document.getElementById('dropzone');
-    const fileInput = document.getElementById('fileInput');
-    const statusDiv = document.getElementById('status');
+    // ---------- state ----------
+    let currentJobId = null;
+    let model = null;             // the JSON object we edit
+    let packaging = [];           // local array for cargo.packaging
 
-    dropzone.addEventListener('click', () => fileInput.click());
+    // ---------- helpers ----------
+    const $ = s => document.querySelector(s);
+    const byId = id => document.getElementById(id);
 
-    dropzone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      dropzone.classList.add('dragover');
-    });
-
-    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-
-    dropzone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('dragover');
-      if (e.dataTransfer.files.length > 0) {
-        handleFile(e.dataTransfer.files[0]);
+    function setStatus(t){ byId('status').textContent = t; }
+    function showPreview(obj){
+      byId('preview').textContent = JSON.stringify(obj, null, 2);
+    }
+    function dottedGet(obj, path){
+      return path.split('.').reduce((o,k)=>o && o[k], obj);
+    }
+    function dottedSet(obj, path, value){
+      const parts = path.split('.');
+      let o = obj;
+      for(let i=0;i<parts.length-1;i++){
+        const k = parts[i];
+        if(!o[k] || typeof o[k] !== 'object') o[k] = {};
+        o = o[k];
       }
-    });
-
-    fileInput.addEventListener('change', () => {
-      if (fileInput.files.length > 0) {
-        handleFile(fileInput.files[0]);
-      }
-    });
-
-    async function handleFile(file) {
-      if (!file.name.toLowerCase().endsWith('.pdf')) {
-        alert("Please upload a PDF file");
-        return;
-      }
-      statusDiv.textContent = "Uploading...";
-
-      const form = new FormData();
-      form.append("file", file);
-
-      try {
-        const res = await fetch("/upload", { method: "POST", body: form });
-        if (!res.ok) throw new Error("Upload failed");
-        const { job_id } = await res.json();
-        statusDiv.textContent = "Processing...";
-        pollResult(job_id);
-      } catch (err) {
-        statusDiv.textContent = "Error: " + err.message;
-      }
+      o[parts[parts.length-1]] = value;
     }
 
-    async function pollResult(jobId) {
+    function enableActions(enabled){
+      ['downloadJson','copyJson','sendWebhook','downloadJson2','copyJson2'].forEach(id=>{
+        byId(id).disabled = !enabled;
+      });
+    }
+
+    // ---------- packaging UI ----------
+    function renderPackaging(){
+      const wrap = byId('packList');
+      wrap.innerHTML = '';
+      packaging.forEach((p,i)=>{
+        const line = document.createElement('div');
+        line.className = 'inline';
+        const input = document.createElement('input');
+        input.type = 'text'; input.value = p; input.style.flex='1';
+        input.addEventListener('input', e => { packaging[i] = e.target.value; syncFromUi(); });
+        const btn = document.createElement('button');
+        btn.className = 'btn'; btn.type='button'; btn.textContent='✖ Remove';
+        btn.onclick = () => { packaging.splice(i,1); renderPackaging(); syncFromUi(); };
+        line.append(input); line.append(btn);
+        wrap.append(line);
+      });
+    }
+
+    function syncToUi(){
+      const paths = [
+        "shipper.name","shipper.address","shipper.contact","shipper.email","shipper.phone","shipper.vat",
+        "consignee.name","consignee.address","consignee.vat",
+        "notify.name","notify.address","notify.email","notify.phone",
+        "refs.shipment_no","refs.order_no_internal","refs.customer_po","refs.delivery_no","refs.customer_no",
+        "refs.loading_date","refs.scheduled_delivery_date",
+        "shipping.shipping_point","shipping.incoterms","shipping.way_of_forwarding","shipping.pol","shipping.pod",
+        "cargo.description","cargo.net_kg","cargo.gross_kg",
+        "marks.carton_marks","marks.labelling","bl.type"
+      ];
+      paths.forEach(p=>{
+        const el = byId(p);
+        if(!el) return;
+        const val = dottedGet(model, p) ?? "";
+        if(el.tagName === 'SELECT') el.value = val || "";
+        else if(el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = val || "";
+      });
+      packaging = Array.isArray(dottedGet(model,'cargo.packaging')) ? [...dottedGet(model,'cargo.packaging')] : [];
+      renderPackaging();
+      showPreview(model);
+      enableActions(true);
+      byId('formWrap').style.display = 'block';
+    }
+
+    function syncFromUi(){
+      const paths = [
+        "shipper.name","shipper.address","shipper.contact","shipper.email","shipper.phone","shipper.vat",
+        "consignee.name","consignee.address","consignee.vat",
+        "notify.name","notify.address","notify.email","notify.phone",
+        "refs.shipment_no","refs.order_no_internal","refs.customer_po","refs.delivery_no","refs.customer_no",
+        "refs.loading_date","refs.scheduled_delivery_date",
+        "shipping.shipping_point","shipping.incoterms","shipping.way_of_forwarding","shipping.pol","shipping.pod",
+        "cargo.description","cargo.net_kg","cargo.gross_kg",
+        "marks.carton_marks","marks.labelling","bl.type"
+      ];
+      paths.forEach(p=>{
+        const el = byId(p); if(!el) return;
+        dottedSet(model, p, el.value);
+      });
+      dottedSet(model, 'cargo.packaging', packaging);
+      showPreview(model);
+    }
+
+    // attach listeners to inputs to keep JSON live-updated
+    document.addEventListener('input', (e)=>{
+      if (!model) return;
+      const id = e.target.id;
+      if (!id) return;
+      const watched = [
+        "shipper.name","shipper.address","shipper.contact","shipper.email","shipper.phone","shipper.vat",
+        "consignee.name","consignee.address","consignee.vat",
+        "notify.name","notify.address","notify.email","notify.phone",
+        "refs.shipment_no","refs.order_no_internal","refs.customer_po","refs.delivery_no","refs.customer_no",
+        "refs.loading_date","refs.scheduled_delivery_date",
+        "shipping.shipping_point","shipping.incoterms","shipping.way_of_forwarding","shipping.pol","shipping.pod",
+        "cargo.description","cargo.net_kg","cargo.gross_kg",
+        "marks.carton_marks","marks.labelling","bl.type"
+      ];
+      if (watched.includes(id)) syncFromUi();
+    });
+
+    byId('addPack').onclick = () => {
+      const v = byId('newPack').value.trim();
+      if (v) { packaging.push(v); byId('newPack').value=''; renderPackaging(); syncFromUi(); }
+    };
+
+    // ---------- upload & poll ----------
+    const drop = byId('drop'), fileInput = byId('file');
+
+    drop.addEventListener('click', ()=> fileInput.click());
+    drop.addEventListener('keydown', (e)=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); fileInput.click(); }});
+    drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.classList.add('dragover'); });
+    drop.addEventListener('dragleave', ()=> drop.classList.remove('dragover'));
+    drop.addEventListener('drop', e=>{
+      e.preventDefault(); drop.classList.remove('dragover');
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) startUpload(f);
+    });
+    fileInput.addEventListener('change', ()=>{ const f = fileInput.files[0]; if(f) startUpload(f); });
+
+    async function startUpload(file){
+      if (!file.name.toLowerCase().endsWith('.pdf')) { alert('Please choose a PDF'); return; }
+      setStatus('Uploading…');
+      enableActions(false);
+      byId('formWrap').style.display='none';
+      model = null; showPreview('–');
+      const form = new FormData(); form.append('file', file);
+      const res = await fetch('/upload', { method:'POST', body: form });
+      if(!res.ok){ setStatus('Upload failed'); return; }
+      const { job_id } = await res.json();
+      currentJobId = job_id; byId('jobid').textContent = job_id;
+      setStatus('Processing…');
+      poll(job_id);
+    }
+
+    async function poll(jobId){
       const url = `/result/${jobId}`;
-      const timer = setInterval(async () => {
-        try {
+      const timer = setInterval(async ()=>{
+        try{
           const res = await fetch(url);
-          const ct = res.headers.get("content-type") || "";
-
-          if (ct.includes("application/json")) {
+          const ct = (res.headers.get('content-type') || '').toLowerCase();
+          if (ct.includes('application/json')) {
             const data = await res.json();
-            if (data.status === "queued" || data.status === "running") {
-              statusDiv.textContent = "Processing (" + data.status + ")...";
-              return; // keep polling
-            }
-            if (data.status === "error") {
-              clearInterval(timer);
-              statusDiv.textContent = "Error: " + (data.error || "Unknown");
-              return;
-            }
+            if (data.status === 'queued' || data.status === 'running') { setStatus('Processing… ('+data.status+')'); return; }
+            if (data.status === 'error') { clearInterval(timer); setStatus('Error: '+(data.error||'unknown')); return; }
+            // Otherwise: we got the FINAL JSON file (served as file). Treat it as model.
+            model = data;
+            clearInterval(timer);
+            setStatus('Ready – edit the form below');
+            syncToUi();
+            return;
+          } else {
+            // It's a PDF blob (from older flow). Offer to download but also try to parse JSON if possible.
+            const blob = await res.blob();
+            clearInterval(timer);
+            setStatus('Result is a PDF (downloaded). If you prefer a form, keep DOC_TEMPLATE_PATH unset.');
+            const a = document.createElement('a');
+            const disp = res.headers.get('content-disposition')||'';
+            const m = /filename="?([^"]+)"?/.exec(disp);
+            a.href = URL.createObjectURL(blob);
+            a.download = m? m[1] : ('result_'+jobId+'.pdf');
+            document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
           }
-
-          // If not JSON, it must be the final file → download
+        }catch(e){
           clearInterval(timer);
-          statusDiv.textContent = "Done! Downloading...";
-
-          const blob = await res.blob();
-          const a = document.createElement("a");
-          const disp = res.headers.get("content-disposition") || "";
-          const m = /filename="?([^"]+)"?/.exec(disp);
-          const filename = m ? m[1] : `result_${jobId}` + (ct.includes("pdf") ? ".pdf" : ".json");
-          a.href = URL.createObjectURL(blob);
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          URL.revokeObjectURL(a.href);
-          a.remove();
-
-          statusDiv.textContent = "Downloaded: " + filename;
-        } catch (err) {
-          clearInterval(timer);
-          statusDiv.textContent = "Error: " + err.message;
+          setStatus('Polling failed: '+ e.message);
         }
       }, 2000);
     }
+
+    // ---------- actions ----------
+    function getEditedJsonBlob(){
+      const data = JSON.stringify(model || {}, null, 2);
+      return new Blob([data], {type:'application/json'});
+    }
+    function downloadJson(){
+      const blob = getEditedJsonBlob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'shipping_instruction.json';
+      document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+    }
+    async function copyJson(){
+      try{
+        await navigator.clipboard.writeText(JSON.stringify(model || {}, null, 2));
+        alert('Copied JSON to clipboard');
+      }catch{ alert('Copy failed'); }
+    }
+    async function sendWebhook(){
+      const url = byId('webhook').value.trim();
+      if(!url){ alert('Enter a webhook URL'); return; }
+      try{
+        const resp = await fetch(url, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(model || {})
+        });
+        alert('Webhook status: '+resp.status);
+      }catch(e){
+        alert('Webhook error: '+e.message);
+      }
+    }
+
+    byId('downloadJson').onclick = downloadJson;
+    byId('downloadJson2').onclick = downloadJson;
+    byId('copyJson').onclick = copyJson;
+    byId('copyJson2').onclick = copyJson;
+    byId('sendWebhook').onclick = sendWebhook;
+
   </script>
 </body>
 </html>
