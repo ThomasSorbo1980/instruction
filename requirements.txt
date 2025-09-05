@@ -1,4 +1,4 @@
 fastapi==0.112.0
 uvicorn[standard]==0.30.5
 pydantic==1.10.15
-adobe-pdfservices-sdk==4.0.0
+adobe-pdfservices-sdk==3.3.0
