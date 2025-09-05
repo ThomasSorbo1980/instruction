@@ -2,4 +2,5 @@ fastapi==0.112.0
 uvicorn[standard]==0.30.5
 pydantic==1.10.15
 requests==2.32.3
-python-docx==0.8.11   # only if you used the auto-create-template option; safe to keep
+python-docx==0.8.11      # ok to keep if you used the auto-template helper
+python-multipart==0.0.9  # <-- REQUIRED for UploadFile/File(...)
