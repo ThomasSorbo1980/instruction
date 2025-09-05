@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse, FileResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 
@@ -11,11 +11,28 @@ from pathlib import Path
 # ---------------------------
 DEFAULT_TEMPLATE = str((Path(__file__).parent / "Shipping_Instruction_Template_Tagged.docx").resolve())
 DOC_TEMPLATE_PATH = os.getenv("DOC_TEMPLATE_PATH", DEFAULT_TEMPLATE)
-DOC_TEMPLATE_URL = os.getenv("DOC_TEMPLATE_URL")  # optional URL to auto-download at startup
+DOC_TEMPLATE_URL = os.getenv("DOC_TEMPLATE_URL")  # optional: direct URL to download template on startup
 
 print("CWD:", os.getcwd())
 print("Resolved DEFAULT_TEMPLATE:", DEFAULT_TEMPLATE)
 print("DOC_TEMPLATE_PATH (env or default):", DOC_TEMPLATE_PATH, "exists:", Path(DOC_TEMPLATE_PATH).exists())
+
+# Optionally download the template at startup if it's missing and a URL is provided
+def _download_to(path: str, url: str):
+    r = requests.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(1024 * 1024):
+            f.write(chunk)
+
+if not Path(DOC_TEMPLATE_PATH).exists() and DOC_TEMPLATE_URL:
+    try:
+        _download_to(DOC_TEMPLATE_PATH, DOC_TEMPLATE_URL)
+        print("Downloaded template to:", DOC_TEMPLATE_PATH, "size:", Path(DOC_TEMPLATE_PATH).stat().st_size)
+    except Exception as e:
+        print("Template download failed:", e)
+print("After ensure_template -> exists:", Path(DOC_TEMPLATE_PATH).exists())
 
 # ---------------------------
 # FastAPI app + frontend
@@ -44,31 +61,81 @@ def index():
 def health():
     return "ok"
 
+# Optional: download the template to verify path in browser
+@app.get("/debug/template")
+def debug_template():
+    p = Path(DOC_TEMPLATE_PATH)
+    if p.exists():
+        return FileResponse(
+            str(p),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename="Shipping_Instruction_Template_Tagged.docx",
+        )
+    return JSONResponse({"error": "Template not found", "path": DOC_TEMPLATE_PATH}, status_code=404)
+
 # ---------------------------
-# Adobe REST helpers (no SDK)
+# Adobe auth (auto token) + REST helpers (no SDK)
 # ---------------------------
-ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")   # EU: https://pdf-services-ew1.adobe.io
-ADOBE_CLIENT_ID = os.getenv("ADOBE_CLIENT_ID")
-ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN")
+ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")  # EU: https://pdf-services-ew1.adobe.io
+ADOBE_IMS_HOST = os.getenv("ADOBE_IMS_HOST", "https://ims-na1.adobelogin.com")
+ADOBE_CLIENT_ID = os.getenv("ADOBE_CLIENT_ID", "")
+ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "")
+ADOBE_SCOPE = os.getenv("ADOBE_SCOPE", "")  # set to the scope string shown in your Adobe credential (if required)
+# If you still want to paste a token for testing, leave this set; otherwise we'll fetch automatically:
+ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")
+
+# Optional for your AI step
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-def _check_env():
-    if not ADOBE_CLIENT_ID or not ADOBE_ACCESS_TOKEN:
-        raise RuntimeError("Missing ADOBE_CLIENT_ID or ADOBE_ACCESS_TOKEN")
+_token_cache = {"access_token": None, "expires_at": 0}
+
+def get_adobe_access_token():
+    """
+    Returns a valid Adobe access token.
+    - If ADOBE_ACCESS_TOKEN env is set, use it as-is (no refresh).
+    - Else do OAuth2 client_credentials to IMS and cache until expiry.
+    """
+    if ADOBE_ACCESS_TOKEN:
+        return ADOBE_ACCESS_TOKEN
+
+    # return cached if still valid (with 60s buffer)
+    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
+
+    if not ADOBE_CLIENT_ID or not ADOBE_CLIENT_SECRET:
+        raise RuntimeError("Missing ADOBE_CLIENT_ID or ADOBE_CLIENT_SECRET for client-credentials")
+
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": ADOBE_CLIENT_ID,
+        "client_secret": ADOBE_CLIENT_SECRET,
+    }
+    if ADOBE_SCOPE:
+        data["scope"] = ADOBE_SCOPE
+
+    resp = requests.post(f"{ADOBE_IMS_HOST}/ims/token/v3", data=data, timeout=30)
+    try:
+        resp.raise_for_status()
+    except Exception:
+        print("IMS token error:", resp.status_code, resp.text[:500])
+        raise
+
+    tok = resp.json()
+    _token_cache["access_token"] = tok["access_token"]
+    _token_cache["expires_at"] = time.time() + int(tok.get("expires_in", 3000))
+    return _token_cache["access_token"]
 
 def _h_json():
-    _check_env()
     return {
         "x-api-key": ADOBE_CLIENT_ID,
-        "Authorization": f"Bearer {ADOBE_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {get_adobe_access_token()}",
         "Content-Type": "application/json",
     }
 
 def _h_auth():
-    _check_env()
     return {
         "x-api-key": ADOBE_CLIENT_ID,
-        "Authorization": f"Bearer {ADOBE_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {get_adobe_access_token()}",
     }
 
 def adobe_assets_create(media_type: str) -> dict:
@@ -78,12 +145,16 @@ def adobe_assets_create(media_type: str) -> dict:
     return r.json()
 
 def adobe_put_upload(upload_uri: str, data: bytes, media_type: str):
+    # presigned URL (no Adobe auth headers)
     r = requests.put(upload_uri, data=data, headers={"Content-Type": media_type}, timeout=300)
     r.raise_for_status()
 
 def adobe_extract_start(asset_id: str) -> str:
     url = f"{ADOBE_HOST}/operation/extractpdf"
-    body = {"assetID": asset_id, "elementsToExtract": ["text", "tables"]}
+    body = {
+        "assetID": asset_id,
+        "elementsToExtract": ["text", "tables"],  # keep minimal for compatibility
+    }
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
         raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
@@ -94,7 +165,7 @@ def adobe_docgen_start(template_asset_id: str, data_asset_id: str) -> str:
     body = {
         "templateAssetID": template_asset_id,
         "jsonDataAssetID": data_asset_id,
-        "outputFormat": "pdf"
+        "outputFormat": "pdf",
     }
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
@@ -114,13 +185,6 @@ def adobe_poll_job(location_url: str, interval_s=2, timeout_s=600) -> dict:
             raise RuntimeError(f"Adobe job failed: {info}")
         time.sleep(interval_s)
     raise TimeoutError("Timed out waiting for Adobe job")
-
-def download_to(url: str, out_path: str):
-    with requests.get(url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                f.write(chunk)
 
 def _find_download_url(obj):
     if isinstance(obj, dict):
@@ -151,7 +215,8 @@ def download_bytes(url: str):
     return content, headers
 
 def save_bytes(path: str, data: bytes):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).parent.mkdir(parents=True, exist_ok=True
+    )
     with open(path, "wb") as f:
         f.write(data)
 
@@ -159,11 +224,13 @@ def save_bytes(path: str, data: bytes):
 # Extract + DocGen pipelines
 # ---------------------------
 def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
+    # 1) upload PDF
     a = adobe_assets_create("application/pdf")
     adobe_put_upload(a["uploadUri"], pdf_bytes, "application/pdf")
+    # 2) start + poll
     loc = adobe_extract_start(a["assetID"])
     info = adobe_poll_job(loc)
-
+    # 3) find download URL (various response shapes)
     zip_url = _find_download_url(info)
     if not zip_url:
         asset_ids = []
@@ -185,16 +252,15 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
                     break
             except Exception:
                 pass
-
     if not zip_url:
         print("Adobe Extract job info (no downloadUri found):", json.dumps(info, indent=2)[:5000])
         raise RuntimeError("No downloadUri from Extract job")
 
+    # 4) download (zip or json)
     blob, headers = download_bytes(zip_url)
     ctype = headers.get("content-type", "")
     dispo = headers.get("content-disposition", "")
     is_zip = "zip" in ctype or ".zip" in dispo.lower()
-    is_json = "json" in ctype or ".json" in dispo.lower()
 
     out_dir = f"{work_prefix}_extract"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -209,15 +275,18 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
             is_zip = False
 
     if not is_zip:
+        # Try JSON or a zip without headers
+        head = blob[:200].decode("utf-8", "ignore")
+        if "<html" in head.lower() and "error" in head.lower():
+            print("Adobe download looked like HTML/error. First 500 bytes:\n", head[:500])
+            raise RuntimeError("Adobe returned an error page instead of extract output.")
         try:
-            head = blob[:200].decode("utf-8", "ignore")
-            if "<html" in head.lower() or "error" in head.lower():
-                print("Adobe download looked like HTML/error. First 500 bytes:\n", head[:500])
-                raise RuntimeError("Adobe returned an error page instead of extract output.")
+            # JSON directly
             json.loads(blob.decode("utf-8", "ignore"))
             p = Path(out_dir, "structuredData.json")
             save_bytes(str(p), blob)
         except Exception:
+            # maybe a zip w/o headers
             try:
                 with zipfile.ZipFile(io.BytesIO(blob), "r") as z:
                     z.extractall(out_dir)
@@ -225,6 +294,7 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
                 preview = blob[:200].decode("utf-8", "ignore")
                 raise RuntimeError(f"Extract download was neither ZIP nor JSON. Preview: {preview}")
 
+    # 5) locate structuredData.json
     p = Path(out_dir, "structuredData.json")
     if not p.exists():
         alt = Path(out_dir, "json", "structuredData.json")
@@ -241,24 +311,34 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
     return str(p)
 
 def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str:
+    # upload template
     t = adobe_assets_create("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with open(template_path, "rb") as tf:
         adobe_put_upload(t["uploadUri"], tf.read(),
                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    # upload json
     d = adobe_assets_create("application/json")
     with open(data_json_path, "rb") as jf:
         adobe_put_upload(d["uploadUri"], jf.read(), "application/json")
+    # start + poll
     loc = adobe_docgen_start(t["assetID"], d["assetID"])
     info = adobe_poll_job(loc)
 
     pdf_url = _find_download_url(info)
     if not pdf_url:
-        print("DocGen job info (no downloadUri found):", json.dumps(info, indent=2)[:5000])
+        print("DocGen job info (no downloadUri found):", json.dumps(info, indent_2)[:5000])  # type: ignore
         raise RuntimeError("No downloadUri from DocGen job")
 
     out_pdf = f"{work_prefix}_filled.pdf"
     download_to(pdf_url, out_pdf)
     return out_pdf
+
+def download_to(url: str, out_path: str):
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
 
 # ---------------------------
 # /upload: FULL FLOW
@@ -274,9 +354,11 @@ async def upload(file: UploadFile = File(...)):
         tmp.write(content)
 
     try:
+        # 1) Adobe Extract
         structured_path = run_extract(content, pdf_path)
-        filled_path = pdf_path.replace(".pdf", "_filled.json")
 
+        # 2) AI normalizer
+        filled_path = pdf_path.replace(".pdf", "_filled.json")
         env = os.environ.copy()
         proc = subprocess.run(
             ["python", "ai_normalizer.py", structured_path, filled_path],
@@ -285,9 +367,9 @@ async def upload(file: UploadFile = File(...)):
         if proc.returncode != 0:
             raise RuntimeError(f"AI normalizer failed: {proc.stderr}")
 
-        template_path = DOC_TEMPLATE_PATH
-        if Path(template_path).exists():
-            final_pdf = run_docgen(template_path, filled_path, pdf_path)
+        # 3) DocGen if template exists, else return JSON
+        if Path(DOC_TEMPLATE_PATH).exists():
+            final_pdf = run_docgen(DOC_TEMPLATE_PATH, filled_path, pdf_path)
             download_name = Path(file.filename).stem + "_filled.pdf"
             return FileResponse(final_pdf, media_type="application/pdf", filename=download_name)
         else:
