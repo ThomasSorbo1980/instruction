@@ -145,11 +145,7 @@ def adobe_extract_start(asset_id: str) -> str:
 
 def adobe_docgen_start(template_asset_id: str, data_asset_id: str = None, inline_json: dict = None) -> str:
     """
-    Start a Document Generation job.
-    You must provide either:
-      - data_asset_id (use when you've uploaded the JSON as an asset), OR
-      - inline_json (a Python dict that will be sent as "jsonData").
-    Returns the Location URL to poll.
+    Start a Document Generation job. Provide either inline_json or data_asset_id.
     """
     url = f"{ADOBE_HOST}/operation/documentgeneration"
 
@@ -166,7 +162,7 @@ def adobe_docgen_start(template_asset_id: str, data_asset_id: str = None, inline
             "outputFormat": "pdf"
         }
     else:
-        raise RuntimeError("adobe_docgen_start: provide inline_json or data_asset_id")
+        raise RuntimeError("Need inline_json or data_asset_id")
 
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
