@@ -75,17 +75,19 @@ def adobe_put_upload(upload_uri: str, data: bytes, media_type: str):
     r.raise_for_status()
 
 def adobe_extract_start(asset_id: str) -> str:
-    """Step 3: Start an Extract job using the uploaded asset; returns a Location URL to poll."""
+    """Start an Extract job using the uploaded asset; returns a Location URL to poll."""
     url = f"{ADOBE_HOST}/operation/extractpdf"
     body = {
         "assetID": asset_id,
-        "elementsToExtract": ["text", "tables", "figures"],
-        "includeStyling": True
+        # Keep it minimal—some regions/tenants reject unsupported values
+        "elementsToExtract": ["text", "tables"]
+        # no includeStyling / no figures
     }
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
         raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
+
 
 def adobe_docgen_start(template_asset_id: str, data_asset_id: str) -> str:
     """Start a Document Generation job; returns a Location URL to poll."""
