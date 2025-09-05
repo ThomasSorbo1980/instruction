@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 import os
@@ -18,6 +18,16 @@ app.add_middleware(
 
 # --- Serve static frontend ---
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- Home page: serve the drag-and-drop UI ---
+@app.get("/", response_class=HTMLResponse)
+def index():
+    path = os.path.join("static", "index.html")
+    if not os.path.exists(path):
+        # Fallback: redirect to /static/index.html if it exists under a different path
+        return RedirectResponse(url="/static/index.html")
+    with open(path, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 # --- Health check route ---
 @app.get("/health", response_class=PlainTextResponse)
