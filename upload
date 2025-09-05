@@ -1,0 +1,38 @@
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a .pdf file")
+
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        pdf_path = tmp.name
+        tmp.write(content)
+
+    try:
+        # 1) Adobe Extract → structuredData.json
+        structured_path = run_extract(content, pdf_path)
+
+        # 2) AI normalizer → filled_data.json
+        filled_path = pdf_path.replace(".pdf", "_filled.json")
+        import subprocess, os
+        env = os.environ.copy()
+        proc = subprocess.run(
+            ["python", "ai_normalizer.py", structured_path, filled_path],
+            env=env, capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"AI normalizer failed: {proc.stderr}")
+
+        # 3) (Optional) Adobe DocGen → final PDF
+        template_path = os.getenv("DOC_TEMPLATE_PATH", "Shipping_Instruction_Template_Tagged.docx")
+        if Path(template_path).exists():
+            final_pdf = run_docgen(template_path, filled_path, pdf_path)
+            download_name = Path(file.filename).stem + "_filled.pdf"
+            return FileResponse(final_pdf, media_type="application/pdf", filename=download_name)
+        else:
+            # If template is missing, return the normalized JSON so you can still use the app
+            return FileResponse(filled_path, media_type="application/json",
+                                filename=Path(file.filename).stem + "_processed.json")
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
