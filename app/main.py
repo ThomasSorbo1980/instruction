@@ -173,17 +173,17 @@ def process_job(job_id: str, src_pdf_path: str):
         # 1) Extract
         structured_path = run_extract_to_structured(Path(src_pdf_path).read_bytes(), src_pdf_path)
 
-        # 2) Normalize → <pdf>_filled.json
+        # 2) Normalize (pass original PDF path for vision assist)
         filled_path = src_pdf_path.replace(".pdf", "_filled.json")
         env = os.environ.copy()
         proc = subprocess.run(
-            ["python", "ai_normalizer.py", structured_path, filled_path],
+            ["python", "ai_normalizer.py", structured_path, filled_path, src_pdf_path],
             env=env, capture_output=True, text=True
         )
         if proc.returncode != 0:
             raise RuntimeError(f"AI normalizer failed: {proc.stderr}")
 
-        # 3) Load normalized JSON and store in memory for direct JSONResponse
+        # 3) Load normalized JSON and store in memory
         with open(filled_path, "r", encoding="utf-8") as jf:
             data_obj = json.load(jf)
 
