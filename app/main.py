@@ -247,34 +247,42 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
     return str(p)
 
 def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str:
+    """
+    Document Generation pipeline (inline JSON).
+    Uploads the template DOCX and sends JSON inline instead of as an asset.
+    Returns path to final PDF.
+    """
     # 1) Upload template DOCX
     t = adobe_assets_create("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with open(template_path, "rb") as tf:
         adobe_put_upload(
-            t["uploadUri"], tf.read(),
+            t["uploadUri"],
+            tf.read(),
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 
-    # 2) Upload data JSON
-    d = adobe_assets_create("application/json")
-    with open(data_json_path, "rb") as jf:
-        adobe_put_upload(d["uploadUri"], jf.read(), "application/json")
+    # 2) Load JSON inline
+    with open(data_json_path, "r", encoding="utf-8") as jf:
+        data_obj = json.load(jf)
 
-    # 3) Start DocGen (using asset IDs) + poll
-    loc = adobe_docgen_start(template_asset_id=t["assetID"], data_asset_id=d["assetID"])
+    # 3) Start DocGen with inline JSON + poll
+    loc = adobe_docgen_start(template_asset_id=t["assetID"], inline_json=data_obj)
     info = adobe_poll_job(loc)
 
     pdf_url = _find_download_url(info)
     if not pdf_url:
         raise RuntimeError("No downloadUri from DocGen job")
 
+    # 4) Download the final PDF
     out_pdf = f"{work_prefix}_filled.pdf"
     with requests.get(pdf_url, stream=True, timeout=300) as r:
         r.raise_for_status()
         with open(out_pdf, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
+
     return out_pdf
+
 
 
 # ---------------------------
