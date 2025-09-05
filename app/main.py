@@ -74,53 +74,41 @@ def debug_template():
     return JSONResponse({"error": "Template not found", "path": DOC_TEMPLATE_PATH}, status_code=404)
 
 # ---------------------------
-# Adobe auth (auto token) + REST helpers (no SDK)
-# ---------------------------
 ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")  # EU: https://pdf-services-ew1.adobe.io
-ADOBE_IMS_HOST = os.getenv("ADOBE_IMS_HOST", "https://ims-na1.adobelogin.com")
 ADOBE_CLIENT_ID = os.getenv("ADOBE_CLIENT_ID", "")
 ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "")
-ADOBE_SCOPE = os.getenv("ADOBE_SCOPE", "")  # set to the scope string shown in your Adobe credential (if required)
-# If you still want to paste a token for testing, leave this set; otherwise we'll fetch automatically:
+# Optional: if you paste a token for testing, we’ll use it; otherwise we’ll fetch from /token:
 ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")
-
-# Optional for your AI step
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 _token_cache = {"access_token": None, "expires_at": 0}
 
 def get_adobe_access_token():
-    """
-    Returns a valid Adobe access token.
-    - If ADOBE_ACCESS_TOKEN env is set, use it as-is (no refresh).
-    - Else do OAuth2 client_credentials to IMS and cache until expiry.
-    """
+    """PDF Services tokens come from <ADOBE_HOST>/token, not IMS."""
     if ADOBE_ACCESS_TOKEN:
         return ADOBE_ACCESS_TOKEN
 
-    # return cached if still valid (with 60s buffer)
     if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
         return _token_cache["access_token"]
 
     if not ADOBE_CLIENT_ID or not ADOBE_CLIENT_SECRET:
-        raise RuntimeError("Missing ADOBE_CLIENT_ID or ADOBE_CLIENT_SECRET for client-credentials")
+        raise RuntimeError("Missing ADOBE_CLIENT_ID or ADOBE_CLIENT_SECRET")
 
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": ADOBE_CLIENT_ID,
-        "client_secret": ADOBE_CLIENT_SECRET,
-    }
-    if ADOBE_SCOPE:
-        data["scope"] = ADOBE_SCOPE
-
-    resp = requests.post(f"{ADOBE_IMS_HOST}/ims/token/v3", data=data, timeout=30)
+    # Per docs: form-encoded body with client_id and client_secret
+    token_url = f"{ADOBE_HOST}/token"
+    resp = requests.post(
+        token_url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={"client_id": ADOBE_CLIENT_ID, "client_secret": ADOBE_CLIENT_SECRET},
+        timeout=30,
+    )
     try:
         resp.raise_for_status()
     except Exception:
-        print("IMS token error:", resp.status_code, resp.text[:500])
+        print("PDF Services /token error:", resp.status_code, resp.text[:500])
         raise
 
     tok = resp.json()
+    # token response looks like {"access_token":"...","expires_in":86400}
     _token_cache["access_token"] = tok["access_token"]
     _token_cache["expires_at"] = time.time() + int(tok.get("expires_in", 3000))
     return _token_cache["access_token"]
@@ -137,88 +125,6 @@ def _h_auth():
         "x-api-key": ADOBE_CLIENT_ID,
         "Authorization": f"Bearer {get_adobe_access_token()}",
     }
-
-def adobe_assets_create(media_type: str) -> dict:
-    url = f"{ADOBE_HOST}/assets"
-    r = requests.post(url, headers=_h_json(), json={"mediaType": media_type}, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def adobe_put_upload(upload_uri: str, data: bytes, media_type: str):
-    # presigned URL (no Adobe auth headers)
-    r = requests.put(upload_uri, data=data, headers={"Content-Type": media_type}, timeout=300)
-    r.raise_for_status()
-
-def adobe_extract_start(asset_id: str) -> str:
-    url = f"{ADOBE_HOST}/operation/extractpdf"
-    body = {
-        "assetID": asset_id,
-        "elementsToExtract": ["text", "tables"],  # keep minimal for compatibility
-    }
-    r = requests.post(url, headers=_h_json(), json=body, timeout=60)
-    if "Location" not in r.headers:
-        raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
-    return r.headers["Location"]
-
-def adobe_docgen_start(template_asset_id: str, data_asset_id: str) -> str:
-    url = f"{ADOBE_HOST}/operation/documentgeneration"
-    body = {
-        "templateAssetID": template_asset_id,
-        "jsonDataAssetID": data_asset_id,
-        "outputFormat": "pdf",
-    }
-    r = requests.post(url, headers=_h_json(), json=body, timeout=60)
-    if "Location" not in r.headers:
-        raise RuntimeError(f"DocGen start failed: {r.status_code} {r.text}")
-    return r.headers["Location"]
-
-def adobe_poll_job(location_url: str, interval_s=2, timeout_s=600) -> dict:
-    end = time.time() + timeout_s
-    while time.time() < end:
-        r = requests.get(location_url, headers=_h_auth(), timeout=30)
-        r.raise_for_status()
-        info = r.json()
-        st = (info.get("status") or "").lower()
-        if st == "done":
-            return info
-        if st == "failed":
-            raise RuntimeError(f"Adobe job failed: {info}")
-        time.sleep(interval_s)
-    raise TimeoutError("Timed out waiting for Adobe job")
-
-def _find_download_url(obj):
-    if isinstance(obj, dict):
-        if "downloadUri" in obj and obj["downloadUri"]:
-            return obj["downloadUri"]
-        for v in obj.values():
-            url = _find_download_url(v)
-            if url:
-                return url
-    elif isinstance(obj, list):
-        for v in obj:
-            url = _find_download_url(v)
-            if url:
-                return url
-    return None
-
-def adobe_asset_get(asset_id: str) -> dict:
-    url = f"{ADOBE_HOST}/assets/{asset_id}"
-    r = requests.get(url, headers=_h_auth(), timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def download_bytes(url: str):
-    r = requests.get(url, stream=True, timeout=300)
-    r.raise_for_status()
-    content = r.content
-    headers = {k.lower(): v for k, v in r.headers.items()}
-    return content, headers
-
-def save_bytes(path: str, data: bytes):
-    Path(path).parent.mkdir(parents=True, exist_ok=True
-    )
-    with open(path, "wb") as f:
-        f.write(data)
 
 # ---------------------------
 # Extract + DocGen pipelines
