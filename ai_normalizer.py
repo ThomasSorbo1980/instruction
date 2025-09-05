@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, json, re, os, math
+import sys, json, re, os, math, io, base64
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -20,9 +20,11 @@ def norm_space(s: str) -> str:
 def clean_scalar(x: Any) -> Any:
     if isinstance(x, str):
         x = x.replace("\u00a0", " ")
-        x = re.sub(r'^\s*([.:;\-_/\\]+)\s*', '', x).strip()
+        x = re.sub(r'^\s*([.:;–\-_/\\]+)\s*', '', x).strip()
         x = re.sub(r'\s{2,}', ' ', x)
-        x = re.sub(r'[.:;\-_/\\]+$', '', x).strip()
+        x = re.sub(r'[.:;–\-_/\\]+$', '', x).strip()
+        # strip common prefixes that sneak in
+        x = re.sub(r'^(?i)(delivery terms|incoterms|pol|pod|net weight|gross weight|shipment no)\s*[:\-–]\s*', '', x).strip()
     return x
 
 def parse_weight(s: str) -> str:
@@ -39,7 +41,6 @@ def parse_weight(s: str) -> str:
 
 # ============================================================
 # Read layout elements from Adobe structuredData.json
-# We try to be tolerant to schema variants.
 # ============================================================
 
 class Span:
@@ -47,7 +48,6 @@ class Span:
     def __init__(self, text: str, page: int, bounds: List[float]):
         self.text = norm_space(text)
         self.page = int(bounds[5]) if len(bounds) >= 6 else page
-        # Adobe bounds often look like [x, y, width, height, rotation, page]
         self.x = float(bounds[0]) if bounds else 0.0
         self.y = float(bounds[1]) if bounds else 0.0
         self.w = float(bounds[2]) if len(bounds) > 2 else 0.0
@@ -58,7 +58,6 @@ class Span:
         return same_line and self.x >= other.x and (self.x - other.x) <= max_dx
 
     def below(self, other, max_dy=120, x_overlap_tol=10):
-        # Some overlap in x to consider it "below the label"
         overlap = (min(self.x + self.w, other.x + other.w) - max(self.x, other.x)) > -x_overlap_tol
         return self.y > other.y and (self.y - other.y) <= max_dy and overlap
 
@@ -67,11 +66,9 @@ def collect_spans(doc: Dict[str, Any]) -> List[Span]:
 
     def walk(node):
         if isinstance(node, dict):
-            # Typical holders
             txt = node.get("Text") or node.get("text") or node.get("content")
             b = node.get("Bounds") or node.get("bounds") or node.get("BBox") or []
             p = node.get("PageNumber") or node.get("pageNumber") or 1
-            # Some nodes store "Lines":[{"Text":"..."}]
             if isinstance(txt, str):
                 spans.append(Span(txt, int(p), b if isinstance(b, list) else []))
             for v in node.values():
@@ -81,21 +78,15 @@ def collect_spans(doc: Dict[str, Any]) -> List[Span]:
                 walk(v)
 
     walk(doc)
-    # Filter empties and sort roughly by page,y,x
     spans = [s for s in spans if s.text]
     spans.sort(key=lambda s: (s.page, s.y, s.x))
     return spans
 
 def collect_tables(doc: Dict[str, Any]) -> List[List[List[str]]]:
-    """
-    Return list of tables; each table is a list of rows; each row is list of cell strings.
-    Tolerates variants: {"Table": {"bodyRows": [{"cells":[{"content":[{"Text":"..."},...]}, ...]}]}}
-    """
     tables: List[List[List[str]]] = []
 
     def norm_cell(cell_obj) -> str:
         if isinstance(cell_obj, dict):
-            # Cells usually have "content" list of text nodes
             cont = cell_obj.get("content") or cell_obj.get("Content") or []
             texts = []
             if isinstance(cont, list):
@@ -111,7 +102,6 @@ def collect_tables(doc: Dict[str, Any]) -> List[List[List[str]]]:
             if "Table" in node or "table" in node:
                 tbl = node.get("Table") or node.get("table")
                 rows = []
-                # Prefer bodyRows; also check "rows"
                 body = tbl.get("bodyRows") or tbl.get("rows") or []
                 for r in body:
                     cells = r.get("cells") or r.get("Cells") or []
@@ -128,7 +118,7 @@ def collect_tables(doc: Dict[str, Any]) -> List[List[List[str]]]:
     return tables
 
 # ============================================================
-# Label dictionaries
+# Labels & helpers
 # ============================================================
 
 LABELS = {
@@ -156,38 +146,22 @@ LABELS = {
 
     "bl_type": ["B/L Type", "BL Type", "Bill of Lading Type", "BOL Type"],
 }
-
 PARTY_LABELS = {
     "shipper": ["Shipper", "Exporter"],
     "consignee": ["Consignee", "Buyer"],
     "notify": ["Notify Party", "Notify"],
 }
+INCOTERMS_SET = {"EXW","FCA","CPT","CIP","DAP","DPU","DDP","FAS","FOB","CFR","CIF"}
 
-INCOTERMS_SET = {"EXW","FCA","CPT","CIP","DAP","DPU","DDP","FAS","FOB","CFR","CIF"}  # 2020 list
-
-# ============================================================
-# Extraction helpers
-# ============================================================
-
-def nearest_value(spans: List[Span], label_span: Span) -> Optional[str]:
-    """
-    Find the best value near a label:
-    1) same line, to the right; else
-    2) nearest below (within window).
-    """
-    # 1) same line to the right
+def nearest_value(spans: List['Span'], label_span: 'Span') -> Optional[str]:
     candidates = [s for s in spans if s.page == label_span.page and s.right_of(label_span)]
-    if candidates:
-        return candidates[0].text
-
-    # 2) below
+    if candidates: return candidates[0].text
     below = [s for s in spans if s.page == label_span.page and s.below(label_span)]
     below.sort(key=lambda s: (s.y - label_span.y, abs(s.x - label_span.x)))
-    if below:
-        return below[0].text
+    if below: return below[0].text
     return None
 
-def find_label_spans(spans: List[Span], labels: List[str]) -> List[Span]:
+def find_label_spans(spans: List['Span'], labels: List[str]) -> List['Span']:
     out = []
     pat = re.compile("|".join([re.escape(l) for l in labels]), re.I)
     for s in spans:
@@ -196,18 +170,11 @@ def find_label_spans(spans: List[Span], labels: List[str]) -> List[Span]:
     return out
 
 def extract_party_block(text: str, tag: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fallback for party name/address from flat text if layout fails.
-    """
     name = None; addr = None
-    # Name line
     m = re.search(rf"{tag}\s*[:\-–]\s*(.+)", text, flags=re.I)
-    if m:
-        name = m.group(1).strip()
-    # Address
+    if m: name = m.group(1).strip()
     m2 = re.search(rf"{tag}.*?(?:Address|Addr)\s*[:\-–]\s*(.+)", text, flags=re.I|re.S)
-    if m2:
-        addr = norm_space(m2.group(1))
+    if m2: addr = norm_space(m2.group(1))
     return name, addr
 
 def flatten_text(doc: Dict[str,Any]) -> str:
@@ -227,9 +194,6 @@ def flatten_text(doc: Dict[str,Any]) -> str:
     return t
 
 def parse_tables_for_pairs(tables: List[List[List[str]]]) -> Dict[str, str]:
-    """
-    Look through 2-column tables or key/value rows and build a small dict.
-    """
     kv = {}
     for tbl in tables:
         for row in tbl:
@@ -239,7 +203,6 @@ def parse_tables_for_pairs(tables: List[List[List[str]]]) -> Dict[str, str]:
                 if len(k)<=60 and len(v)<=200:
                     kv[k] = v
             elif len(cells) > 2:
-                # sometimes "Key : Value" split across columns
                 joined = " ".join(cells)
                 m = re.match(r"(.{2,60})\s*[:\-–]\s*(.{1,200})$", joined)
                 if m:
@@ -247,7 +210,7 @@ def parse_tables_for_pairs(tables: List[List[List[str]]]) -> Dict[str, str]:
     return kv
 
 # ============================================================
-# Core extraction using layout + tables + fallbacks
+# Core extraction
 # ============================================================
 
 def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,7 +219,7 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
     tables = collect_tables(doc)
     table_kv = parse_tables_for_pairs(tables)
 
-    # Parties (name/address) via labels + proximity
+    # Parties
     party = {"shipper":{}, "consignee":{}, "notify":{}}
     for role, labels in PARTY_LABELS.items():
         label_spans = find_label_spans(spans, labels)
@@ -264,9 +227,7 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
         if label_spans:
             v = nearest_value(spans, label_spans[0])
             if v: name = v
-            # try an "Address" label near-by
             addr_span = find_label_spans(spans, ["Address","Addr"])
-            # choose the address label on same/next lines and closest
             if addr_span:
                 addr_candidates = sorted(
                     [(s, math.hypot((s.x - label_spans[0].x), (s.y - label_spans[0].y))) for s in addr_span
@@ -277,29 +238,23 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
                     addr_v = nearest_value(spans, addr_candidates[0][0])
                     if addr_v: addr = addr_v
         if not name:
-            # fallback from flat text
             nm, ad = extract_party_block(text, labels[0])
             name = name or nm
             addr = addr or ad
         party[role] = {"name": name or None, "address": addr or None}
 
-    # Basic refs via label proximity or tables
     def pick_from(label_key, max_chars=120):
-        # 1) table kv
         for lab in LABELS[label_key]:
             for k,v in table_kv.items():
                 if re.fullmatch(rf".*{re.escape(lab)}.*", k, flags=re.I):
                     return v
-        # 2) label spans
         lsp = find_label_spans(spans, LABELS[label_key])
         if lsp:
             v = nearest_value(spans, lsp[0])
             if v: return v
-        # 3) flat fallback: Label: value
         pat = rf"(?:{'|'.join(map(re.escape,LABELS[label_key]))})\s*[:\-–]\s*(.{{1,{max_chars}}})"
         m = re.search(pat, text, flags=re.I)
-        if m:
-            return m.group(1).strip()
+        if m: return m.group(1).strip()
         return ""
 
     shipment_no = pick_from("shipment_no")
@@ -324,7 +279,6 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
     labelling = pick_from("labelling", 140)
     bl_type = pick_from("bl_type", 50)
 
-    # Normalize weights
     net_kg = parse_weight(net_raw) if net_raw else ""
     gross_kg = parse_weight(gross_raw) if gross_raw else ""
 
@@ -350,7 +304,7 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
         },
         "cargo": {
             "description": cargo_description or None,
-            "packaging": None,  # can be extended to parse table rows of packages if needed
+            "packaging": None,
             "net_kg": net_kg or (net_raw or None),
             "gross_kg": gross_kg or (gross_raw or None),
         },
@@ -365,11 +319,10 @@ def extract_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 # ============================================================
-# Post processing + optional LLM refinement
+# Post processing + optional LLM + vision assist
 # ============================================================
 
 def postprocess_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Clean common scalar fields
     paths = [
         "refs.shipment_no", "refs.order_no_internal", "refs.customer_po",
         "refs.delivery_no", "refs.customer_no", "refs.loading_date",
@@ -394,20 +347,17 @@ def postprocess_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
     for p in paths:
         getset(payload, p)
 
-    # Infer Incoterms if buried elsewhere
     w = (payload.get("shipping", {}) or {}).get("way_of_forwarding") or ""
     if w and not payload["shipping"].get("incoterms"):
         m = re.search(r"\b([A-Z]{3})\b", w)
         if m and m.group(1).upper() in INCOTERMS_SET:
             payload["shipping"]["incoterms"] = m.group(1).upper()
 
-    # Normalize weights again in case clean_scalar changed them
     for k in ("net_kg","gross_kg"):
         val = payload.get("cargo",{}).get(k)
         if isinstance(val,str):
             payload["cargo"][k] = parse_weight(val) or val
 
-    # Drop empty strings -> None
     def drop_empties(d):
         if isinstance(d, dict):
             for k, v in list(d.items()):
@@ -422,82 +372,155 @@ def postprocess_cleanup(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 def llm_refine(payload: Dict[str, Any], text: str) -> Dict[str, Any]:
-    """
-    Optional: if OPENAI_API_KEY is present, ask a model to fix obvious gaps
-    and standardize fields. We keep it conservative (no hallucinating).
-    """
     api_key = os.getenv("OPENAI_API_KEY", "")
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     if not api_key:
         return payload
-
+    import requests as _rq
+    system = (
+        "You are a cautious data normalizer for shipping instructions.\n"
+        "Fix trivial OCR errors, remove leading labels (e.g., 'Delivery Terms:'), "
+        "standardize Incoterms to one of EXW,FCA,CPT,CIP,DAP,DPU,DDP,FAS,FOB,CFR,CIF. "
+        "Never invent values. If uncertain, leave value unchanged."
+    )
+    user = {"text_excerpt": text[:6000], "json": payload}
     try:
-        import requests as _rq
-        prompt = {
-            "role": "system",
-            "content": (
-                "You correct a JSON form extracted from a shipping instruction PDF.\n"
-                "Use only facts in the provided 'text' unless it's a trivial formatting fix.\n"
-                "Allowed fixes: trim noise, correct obvious OCR typos (Incoterms, ports, weights),\n"
-                "standardize Incoterms to one of EXW,FCA,CPT,CIP,DAP,DPU,DDP,FAS,FOB,CFR,CIF.\n"
-                "Never fabricate values. If unsure, leave fields as-is."
-            )
-        }
-        user = {
-            "role": "user",
-            "content": json.dumps({
-                "text_excerpt": text[:6000],
-                "json": payload
-            }, ensure_ascii=False)
-        }
-        # Use Chat Completions format (gpt-4o-mini cheap/good)
         resp = _rq.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4o-mini",
-                "messages": [prompt, user],
+                "model": model,
+                "messages": [
+                    {"role":"system","content":system},
+                    {"role":"user","content":json.dumps(user, ensure_ascii=False)}
+                ],
                 "temperature": 0.1,
                 "response_format": {"type":"json_object"}
-            },
-            timeout=40
+            }, timeout=40
         )
         resp.raise_for_status()
-        msg = resp.json()["choices"][0]["message"]["content"]
-        fixed = json.loads(msg)
-        # Sanity: merge fixed onto original, don't drop keys
+        fixed = json.loads(resp.json()["choices"][0]["message"]["content"])
         def deep_merge(a,b):
             if isinstance(a,dict) and isinstance(b,dict):
                 out = dict(a)
                 for k,v in b.items():
                     out[k] = deep_merge(a.get(k), v)
                 return out
-            return b if b is not None else a
+            return b if (b not in (None,"")) else a
         return deep_merge(payload, fixed)
     except Exception as e:
-        # Fail quietly—return original payload
         print("LLM refine skipped:", e)
         return payload
+
+def llm_vision_fix(pdf_path: Optional[str], payload: Dict[str, Any], low_keys: List[str]) -> Dict[str, Any]:
+    if not pdf_path or os.getenv("VISION_ASSIST","0") != "1":
+        return payload
+    api_key = os.getenv("OPENAI_API_KEY","")
+    model = os.getenv("LLM_MODEL","gpt-4o")
+    if not api_key:
+        return payload
+    try:
+        from pdf2image import convert_from_path
+    except Exception as e:
+        print("Vision assist skipped: pdf2image not available", e)
+        return payload
+    try:
+        pages = convert_from_path(pdf_path, dpi=150, fmt="PNG")
+    except Exception as e:
+        print("pdf render failed:", e)
+        return payload
+
+    def b64(img):
+        from io import BytesIO
+        bio = BytesIO()
+        img.save(bio, format="PNG")
+        return base64.b64encode(bio.getvalue()).decode("utf-8")
+
+    def set_dotted(o, path, value):
+        parts = path.split(".")
+        cur = o
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict): cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = value
+
+    import requests as _rq
+    label_hints = {
+        "refs.shipment_no": ["Shipment No", "Shipment #", "SLI"],
+        "shipping.incoterms": ["Incoterms", "Delivery Terms"],
+        "shipping.pol": ["POL", "Port of Loading"],
+        "shipping.pod": ["POD", "Port of Discharge","Destination Port"],
+        "cargo.net_kg": ["Net Weight","Net (kg)"],
+        "cargo.gross_kg": ["Gross Weight","Gross (kg)"],
+        "shipper.name": ["Shipper","Exporter"],
+        "consignee.name": ["Consignee","Buyer"],
+        "notify.name": ["Notify","Notify Party"],
+    }
+
+    for key in low_keys:
+        if not pages: break
+        img_b64 = b64(pages[0])
+        hint = ", ".join(label_hints.get(key, []))
+        prompt = (
+            f"Extract a clean value for '{key}'. "
+            f"If units are present, normalize (weights in kg). "
+            f"If value is missing or uncertain, return an empty string.\n"
+            f"Helpful labels nearby: {hint}."
+        )
+        try:
+            resp = _rq.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role":"system","content":"You read shipping documents from an image and return JSON with one key 'value'."},
+                        {"role":"user","content":[
+                            {"type":"text","text": prompt},
+                            {"type":"image_url","image_url":{"url": f"data:image/png;base64,{img_b64}"}}
+                        ]}
+                    ],
+                    "max_tokens": 150,
+                    "temperature": 0.0,
+                    "response_format":{"type":"json_object"}
+                }, timeout=60
+            )
+            resp.raise_for_status()
+            val = json.loads(resp.json()["choices"][0]["message"]["content"]).get("value","")
+            if val:
+                if key.endswith("incoterms"):
+                    m = re.findall(r"\b(EXW|FCA|CPT|CIP|DAP|DPU|DDP|FAS|FOB|CFR|CIF)\b", val.upper())
+                    if m: val = m[0]
+                if key.endswith(("net_kg","gross_kg")):
+                    val = parse_weight(val) or val
+                set_dotted(payload, key, val)
+        except Exception as e:
+            print(f"Vision assist for {key} failed:", e)
+
+    return payload
 
 # ============================================================
 # CLI
 # ============================================================
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python ai_normalizer.py <structuredData.json> <out.json>")
+    if len(sys.argv) < 3:
+        print("Usage: python ai_normalizer.py <structuredData.json> <out.json> [original.pdf]")
         sys.exit(1)
 
     in_json = sys.argv[1]
     out_json = sys.argv[2]
+    pdf_path = sys.argv[3] if len(sys.argv) >= 4 else None
 
     doc = load_structured(in_json)
     spans_text = flatten_text(doc)
 
     payload = extract_fields(doc)
     payload = postprocess_cleanup(payload)
+
     payload = llm_refine(payload, spans_text)
 
-    # Confidence map (simple heuristic)
+    # naive confidence map
     conf = {}
     def mark(d: Dict[str, Any], prefix=""):
         for k, v in d.items():
@@ -508,6 +531,13 @@ def main():
                 conf[key] = 0.95 if (isinstance(v, str) and v.strip()) else (0.6 if v not in (None, "") else 0.0)
     mark(payload)
     payload["_confidence"] = conf
+
+    # vision assist on key low-confidence fields
+    low = [k for k,v in conf.items()
+           if k in ("refs.shipment_no","shipping.incoterms","shipping.pol","shipping.pod",
+                    "cargo.net_kg","cargo.gross_kg","shipper.name","consignee.name","notify.name")
+           and v < 0.8]
+    payload = llm_vision_fix(pdf_path, payload, low)
 
     Path(out_json).parent.mkdir(parents=True, exist_ok=True)
     with open(out_json, "w", encoding="utf-8") as f:
