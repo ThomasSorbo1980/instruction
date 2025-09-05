@@ -1,96 +1,124 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Drop a PDF → Get Processed Output</title>
-<style>
-  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
-  body { margin: 0; background:#0f172a; color:#e5e7eb; display:flex; align-items:center; justify-content:center; min-height:100vh; }
-  .card { background:#111827; border:1px solid #1f2937; border-radius:16px; padding:28px; max-width:720px; width:94%; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
-  h1 { margin: 0 0 10px; font-size: 20px; }
-  p { opacity:.8; }
-  .drop { margin-top:16px; border:2px dashed #334155; border-radius:12px; padding:34px; text-align:center; transition: all .2s ease; background:#0b1220; }
-  .drop.dragover { border-color:#60a5fa; background:#0b1930; }
-  .btn { display:inline-block; margin-top:10px; padding:10px 14px; border-radius:10px; border:1px solid #334155; background:#1f2937; color:#e5e7eb; cursor:pointer; }
-  .btn:hover { background:#273244; }
-  #status { margin-top:12px; font-size:14px; opacity:.9; }
-  #result { margin-top:16px; display:none; }
-  .link { color:#93c5fd; text-decoration:none; }
-  .link:hover { text-decoration:underline; }
-  input[type=file] { display:none; }
-</style>
+  <meta charset="UTF-8">
+  <title>Instruction PDF Processor</title>
+  <style>
+    body { font-family: sans-serif; margin: 40px; background: #f7f7f7; }
+    h1 { font-size: 1.4em; }
+    #dropzone {
+      border: 3px dashed #999;
+      border-radius: 12px;
+      padding: 50px;
+      text-align: center;
+      background: white;
+      color: #666;
+      cursor: pointer;
+    }
+    #dropzone.dragover { border-color: #007BFF; color: #007BFF; }
+    #status { margin-top: 20px; font-size: 1.1em; }
+  </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Drag & drop a PDF</h1>
-    <p>This will upload the file, extract + normalize data with AI, and return a processed file.</p>
+  <h1>Upload your Shipping Instruction PDF</h1>
 
-    <div id="drop" class="drop">
-      <p>Drop your <strong>.pdf</strong> here</p>
-      <label class="btn">
-        Or choose a file
-        <input id="file" type="file" accept="application/pdf">
-      </label>
-    </div>
+  <div id="dropzone">Drop PDF here or click to select</div>
+  <input type="file" id="fileInput" accept="application/pdf" style="display:none;" />
 
-    <div id="status"></div>
-    <div id="result">
-      <p>✅ Done. <a id="download" class="link" href="#" download>Download result</a></p>
-    </div>
-  </div>
+  <div id="status">Idle</div>
 
-<script>
-const drop = document.getElementById('drop');
-const statusEl = document.getElementById('status');
-const resultEl = document.getElementById('result');
-const downloadEl = document.getElementById('download');
-const fileInput = document.getElementById('file');
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const statusDiv = document.getElementById('status');
 
-function setStatus(msg){ statusEl.textContent = msg; }
-function setDrag(on){ drop.classList.toggle('dragover', !!on); }
+    dropzone.addEventListener('click', () => fileInput.click());
 
-drop.addEventListener('dragover', e => { e.preventDefault(); setDrag(true); });
-drop.addEventListener('dragleave', e => { setDrag(false); });
-drop.addEventListener('drop', async e => {
-  e.preventDefault(); setDrag(false);
-  const file = e.dataTransfer.files[0];
-  if(!file) return;
-  await upload(file);
-});
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('dragover');
+    });
 
-fileInput.addEventListener('change', async e => {
-  const file = e.target.files[0];
-  if(!file) return;
-  await upload(file);
-});
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
 
-async function upload(file){
-  if(!file.name.toLowerCase().endsWith('.pdf')){
-    setStatus('Please choose a .pdf file');
-    return;
-  }
-  setStatus('Uploading and processing...');
-  resultEl.style.display = 'none';
-  try{
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch('/upload', { method:'POST', body: fd });
-    if(!res.ok){
-      const t = await res.text();
-      throw new Error('Server error: ' + t);
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) {
+        handleFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        handleFile(fileInput.files[0]);
+      }
+    });
+
+    async function handleFile(file) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        alert("Please upload a PDF file");
+        return;
+      }
+      statusDiv.textContent = "Uploading...";
+
+      const form = new FormData();
+      form.append("file", file);
+
+      try {
+        const res = await fetch("/upload", { method: "POST", body: form });
+        if (!res.ok) throw new Error("Upload failed");
+        const { job_id } = await res.json();
+        statusDiv.textContent = "Processing...";
+        pollResult(job_id);
+      } catch (err) {
+        statusDiv.textContent = "Error: " + err.message;
+      }
     }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    downloadEl.href = url;
-    downloadEl.download = file.name.replace('.pdf','_processed.json'); // change to .pdf after Doc Gen
-    resultEl.style.display = 'block';
-    setStatus('');
-  }catch(err){
-    console.error(err);
-    setStatus('Error: ' + err.message);
-  }
-}
-</script>
+
+    async function pollResult(jobId) {
+      const url = `/result/${jobId}`;
+      const timer = setInterval(async () => {
+        try {
+          const res = await fetch(url);
+          const ct = res.headers.get("content-type") || "";
+
+          if (ct.includes("application/json")) {
+            const data = await res.json();
+            if (data.status === "queued" || data.status === "running") {
+              statusDiv.textContent = "Processing (" + data.status + ")...";
+              return; // keep polling
+            }
+            if (data.status === "error") {
+              clearInterval(timer);
+              statusDiv.textContent = "Error: " + (data.error || "Unknown");
+              return;
+            }
+          }
+
+          // If not JSON, it must be the final file → download
+          clearInterval(timer);
+          statusDiv.textContent = "Done! Downloading...";
+
+          const blob = await res.blob();
+          const a = document.createElement("a");
+          const disp = res.headers.get("content-disposition") || "";
+          const m = /filename="?([^"]+)"?/.exec(disp);
+          const filename = m ? m[1] : `result_${jobId}` + (ct.includes("pdf") ? ".pdf" : ".json");
+          a.href = URL.createObjectURL(blob);
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          URL.revokeObjectURL(a.href);
+          a.remove();
+
+          statusDiv.textContent = "Downloaded: " + filename;
+        } catch (err) {
+          clearInterval(timer);
+          statusDiv.textContent = "Error: " + err.message;
+        }
+      }, 2000);
+    }
+  </script>
 </body>
 </html>
