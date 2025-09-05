@@ -146,6 +146,20 @@ def adobe_asset_get(asset_id: str) -> dict:
     r = requests.get(url, headers=_h_auth(), timeout=60)
     r.raise_for_status()
     return r.json()  # often includes downloadUri or a list of representations
+import io
+
+def download_bytes(url: str):
+    """Download and return (bytes, headers). No Adobe headers are needed for presigned URLs."""
+    r = requests.get(url, stream=True, timeout=300)
+    r.raise_for_status()
+    content = r.content
+    headers = {k.lower(): v for k, v in r.headers.items()}
+    return content, headers
+
+def save_bytes(path: str, data: bytes):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
 
 def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
     """Extract pipeline → returns path to structuredData.json, handling multiple response shapes."""
@@ -190,32 +204,71 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
         print("Adobe Extract job info (no downloadUri found):", json.dumps(info, indent=2)[:5000])
         raise RuntimeError("No downloadUri from Extract job")
 
-    # 5) Download ZIP
-    out_zip = f"{work_prefix}_extract.zip"
-    download_to(zip_url, out_zip)
+       # 5) Download result (ZIP or JSON)
+    blob, headers = download_bytes(zip_url)
+    ctype = headers.get("content-type", "")
+    dispo = headers.get("content-disposition", "")
 
-    # 6) Unzip and locate structuredData.json
+    # Heuristics to decide the format
+    is_zip = "zip" in ctype or ".zip" in dispo.lower()
+    is_json = "json" in ctype or ".json" in dispo.lower()
+
     out_dir = f"{work_prefix}_extract"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_zip, "r") as z:
-        z.extractall(out_dir)
 
-    # structuredData.json might be at root or under /json/
+    if is_zip:
+        out_zip = f"{work_prefix}_extract.zip"
+        save_bytes(out_zip, blob)
+        try:
+            with zipfile.ZipFile(out_zip, "r") as z:
+                z.extractall(out_dir)
+        except zipfile.BadZipFile:
+            # Not a real zip—fall back to JSON detection
+            is_zip = False
+
+    if not is_zip:
+        # Try to interpret as JSON (Adobe sometimes returns structuredData.json directly)
+        try:
+            # Basic sanity check: not an HTML error page
+            head = blob[:200].decode("utf-8", "ignore")
+            if "<html" in head.lower() or "error" in head.lower():
+                # Log full snippet to Render logs for debugging
+                print("Adobe download looked like HTML/error. First 500 bytes:\n", head[:500])
+                raise RuntimeError("Adobe returned an error page instead of extract output (token expired or link invalid).")
+
+            # If it's JSON, write it as structuredData.json
+            json.loads(blob.decode("utf-8", "ignore"))  # validate
+            p = Path(out_dir, "structuredData.json")
+            save_bytes(str(p), blob)
+        except Exception as ex:
+            # Last attempt: try to open as a zip from memory (some CDNs omit headers)
+            try:
+                with zipfile.ZipFile(io.BytesIO(blob), "r") as z:
+                    z.extractall(out_dir)
+            except zipfile.BadZipFile:
+                # Give a helpful error with a short preview
+                preview = blob[:200].decode("utf-8", "ignore")
+                raise RuntimeError(f"Extract download was neither ZIP nor JSON. Preview: {preview}")
+
+    # 6) Find structuredData.json wherever it ended up
     p = Path(out_dir, "structuredData.json")
     if not p.exists():
         alt = Path(out_dir, "json", "structuredData.json")
         if alt.exists():
             p = alt
         else:
-            # As a last resort, search the whole tree
-            for candidate in Path(out_dir).rglob("structuredData.json"):
-                p = candidate
-                break
-            if not p.exists():
-                # Debug list files to logs
-                print("Extracted files:", [str(x) for x in Path(out_dir).rglob("*")][:200])
-                raise RuntimeError("structuredData.json not found in Extract ZIP")
+            # Search entire tree just in case
+            candidates = list(Path(out_dir).rglob("structuredData.json"))
+            if candidates:
+                p = candidates[0]
+            else:
+                # Log directory contents to help debug
+                listing = [str(x) for x in Path(out_dir).rglob("*")][:200]
+                print("Extracted files:\n", "\n".join(listing))
+                raise RuntimeError("structuredData.json not found in Extract output")
+
     return str(p)
+
 
 
 def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str:
