@@ -1,6 +1,11 @@
-fastapi==0.112.0
-uvicorn[standard]==0.30.5
-pydantic==1.10.15
+fastapi==0.110.0
+uvicorn==0.30.5
+python-multipart==0.0.9
 requests==2.32.3
-python-docx==0.8.11      # ok to keep if you used the auto-template helper
-python-multipart==0.0.9  # <-- REQUIRED for UploadFile/File(...)
+pydantic==1.10.15
+
+# Optional vision/OCR helpers (used only if VISION_ASSIST=1)
+pdf2image==1.17.0
+pillow==10.4.0
+pypdf==4.3.1
+pytesseract==0.3.10
