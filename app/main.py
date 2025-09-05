@@ -81,9 +81,15 @@ ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "")
 ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")
 
 _token_cache = {"access_token": None, "expires_at": 0}
+ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")  # or https://pdf-services-ew1.adobe.io for EU
+ADOBE_CLIENT_ID = os.getenv("ADOBE_CLIENT_ID", "")
+ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "")
+ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")
+
+_token_cache = {"access_token": None, "expires_at": 0}
 
 def get_adobe_access_token():
-    """PDF Services tokens come from <ADOBE_HOST>/token, not IMS."""
+    """Get token directly from PDF Services /token endpoint."""
     if ADOBE_ACCESS_TOKEN:
         return ADOBE_ACCESS_TOKEN
 
@@ -93,7 +99,6 @@ def get_adobe_access_token():
     if not ADOBE_CLIENT_ID or not ADOBE_CLIENT_SECRET:
         raise RuntimeError("Missing ADOBE_CLIENT_ID or ADOBE_CLIENT_SECRET")
 
-    # Per docs: form-encoded body with client_id and client_secret
     token_url = f"{ADOBE_HOST}/token"
     resp = requests.post(
         token_url,
@@ -108,7 +113,6 @@ def get_adobe_access_token():
         raise
 
     tok = resp.json()
-    # token response looks like {"access_token":"...","expires_in":86400}
     _token_cache["access_token"] = tok["access_token"]
     _token_cache["expires_at"] = time.time() + int(tok.get("expires_in", 3000))
     return _token_cache["access_token"]
@@ -125,7 +129,6 @@ def _h_auth():
         "x-api-key": ADOBE_CLIENT_ID,
         "Authorization": f"Bearer {get_adobe_access_token()}",
     }
-
 # ---------------------------
 # Extract + DocGen pipelines
 # ---------------------------
