@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, FileResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 
@@ -7,33 +7,7 @@ import os, time, zipfile, tempfile, subprocess, json, io, requests, uuid, thread
 from pathlib import Path
 
 # ---------------------------
-# Template path resolution
-# ---------------------------
-DEFAULT_TEMPLATE = str((Path(__file__).parent / "Shipping_Instruction_Template_Tagged.docx").resolve())
-DOC_TEMPLATE_PATH = os.getenv("DOC_TEMPLATE_PATH", DEFAULT_TEMPLATE)
-DOC_TEMPLATE_URL = os.getenv("DOC_TEMPLATE_URL")  # optional URL to auto-download at startup
-
-print("CWD:", os.getcwd())
-print("Resolved DEFAULT_TEMPLATE:", DEFAULT_TEMPLATE)
-print("DOC_TEMPLATE_PATH:", DOC_TEMPLATE_PATH, "exists:", Path(DOC_TEMPLATE_PATH).exists())
-
-def _download_to(path: str, url: str):
-    r = requests.get(url, stream=True, timeout=120)
-    r.raise_for_status()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            f.write(chunk)
-
-if not Path(DOC_TEMPLATE_PATH).exists() and DOC_TEMPLATE_URL:
-    try:
-        _download_to(DOC_TEMPLATE_PATH, DOC_TEMPLATE_URL)
-        print("Downloaded template to:", DOC_TEMPLATE_PATH)
-    except Exception as e:
-        print("Template download failed:", e)
-
-# ---------------------------
-# FastAPI app
+# FastAPI + static
 # ---------------------------
 app = FastAPI()
 
@@ -59,24 +33,13 @@ def index():
 def health():
     return "ok"
 
-@app.get("/debug/template")
-def debug_template():
-    p = Path(DOC_TEMPLATE_PATH)
-    if p.exists():
-        return FileResponse(
-            str(p),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename="Shipping_Instruction_Template_Tagged.docx",
-        )
-    return JSONResponse({"error": "Template not found", "path": DOC_TEMPLATE_PATH}, status_code=404)
-
 # ---------------------------
 # Adobe Auth (PDF Services /token)
 # ---------------------------
-ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")  # or https://pdf-services-ew1.adobe.io for EU
+ADOBE_HOST = os.getenv("ADOBE_HOST", "https://pdf-services.adobe.io")  # EU: https://pdf-services-ew1.adobe.io
 ADOBE_CLIENT_ID = os.getenv("ADOBE_CLIENT_ID", "")
 ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "")
-ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")  # leave empty to auto-fetch via /token
+ADOBE_ACCESS_TOKEN = os.getenv("ADOBE_ACCESS_TOKEN", "")  # leave unset to auto-fetch
 
 _token_cache = {"access_token": None, "expires_at": 0}
 
@@ -118,13 +81,13 @@ def _h_auth():
     }
 
 # ---------------------------
-# Adobe Helpers
+# Adobe helpers: assets, extract
 # ---------------------------
 def adobe_assets_create(media_type: str) -> dict:
     url = f"{ADOBE_HOST}/assets"
     r = requests.post(url, headers=_h_json(), json={"mediaType": media_type}, timeout=60)
     r.raise_for_status()
-    return r.json()
+    return r.json()  # {assetID, uploadUri}
 
 def adobe_put_upload(upload_uri: str, data: bytes, media_type: str):
     r = requests.put(upload_uri, data=data, headers={"Content-Type": media_type}, timeout=300)
@@ -137,19 +100,6 @@ def adobe_extract_start(asset_id: str) -> str:
     if "Location" not in r.headers:
         raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
-
-def adobe_docgen_start(template_asset_id: str, inline_json: dict) -> str:
-    url = f"{ADOBE_HOST}/operation/documentgeneration"
-    body = {
-        "assetID": template_asset_id,
-        "outputFormat": "pdf",              # "pdf" per REST example (SDK uses OutputFormat.PDF)
-        "jsonDataForMerge": inline_json     # <-- this is the correct key
-    }
-    r = requests.post(url, headers=_h_json(), json=body, timeout=60)
-    if "Location" not in r.headers:
-        raise RuntimeError(f"DocGen start failed: {r.status_code} {r.text}")
-    return r.headers["Location"]
-
 
 def adobe_poll_job(location_url: str, interval_s=2, timeout_s=900) -> dict:
     end = time.time() + timeout_s
@@ -170,14 +120,12 @@ def _find_download_url(obj):
         if "downloadUri" in obj and obj["downloadUri"]:
             return obj["downloadUri"]
         for v in obj.values():
-            url = _find_download_url(v)
-            if url:
-                return url
+            u = _find_download_url(v)
+            if u: return u
     elif isinstance(obj, list):
         for v in obj:
-            url = _find_download_url(v)
-            if url:
-                return url
+            u = _find_download_url(v)
+            if u: return u
     return None
 
 def download_bytes(url: str):
@@ -190,10 +138,7 @@ def save_bytes(path: str, data: bytes):
     with open(path, "wb") as f:
         f.write(data)
 
-# ---------------------------
-# Extract + DocGen
-# ---------------------------
-def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
+def run_extract_to_structured(pdf_bytes: bytes, work_prefix: str) -> str:
     a = adobe_assets_create("application/pdf")
     adobe_put_upload(a["uploadUri"], pdf_bytes, "application/pdf")
     loc = adobe_extract_start(a["assetID"])
@@ -215,47 +160,20 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
         raise RuntimeError("structuredData.json not found in Extract output")
     return str(p)
 
-def run_docgen_inline(template_path: str, data_json_path: str, work_prefix: str) -> str:
-    # Upload template DOCX
-    t = adobe_assets_create("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-    with open(template_path, "rb") as tf:
-        adobe_put_upload(t["uploadUri"], tf.read(),
-                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-    # Load your normalized JSON
-    with open(data_json_path, "r", encoding="utf-8") as jf:
-        data_obj = json.load(jf)
-
-    # Start DocGen with the *correct* inline key
-    loc = adobe_docgen_start(template_asset_id=t["assetID"], inline_json=data_obj)
-    info = adobe_poll_job(loc)
-
-    pdf_url = _find_download_url(info)
-    if not pdf_url:
-        raise RuntimeError("No downloadUri from DocGen job")
-
-    out_pdf = f"{work_prefix}_filled.pdf"
-    with requests.get(pdf_url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(out_pdf, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                f.write(chunk)
-    return out_pdf
-
-
 # ---------------------------
-# Background job machinery
+# Background job machinery (JSON result only)
 # ---------------------------
-JOBS = {}  # job_id -> {"status": "queued|running|done|error", "result_path": str|None, "error": str|None, "download_name": str|None}
+JOBS = {}  # job_id -> {"status": "queued|running|done|error", "json": dict|None, "error": str|None}
 JOBS_LOCK = threading.Lock()
 
-def process_job(job_id: str, src_pdf_path: str, orig_name: str):
+def process_job(job_id: str, src_pdf_path: str):
     with JOBS_LOCK:
         JOBS[job_id]["status"] = "running"
     try:
         # 1) Extract
-        structured_path = run_extract(Path(src_pdf_path).read_bytes(), src_pdf_path)
-        # 2) Normalize
+        structured_path = run_extract_to_structured(Path(src_pdf_path).read_bytes(), src_pdf_path)
+
+        # 2) Normalize → <pdf>_filled.json
         filled_path = src_pdf_path.replace(".pdf", "_filled.json")
         env = os.environ.copy()
         proc = subprocess.run(
@@ -264,16 +182,14 @@ def process_job(job_id: str, src_pdf_path: str, orig_name: str):
         )
         if proc.returncode != 0:
             raise RuntimeError(f"AI normalizer failed: {proc.stderr}")
-        # 3) DocGen (if template exists) else return JSON
-        if Path(DOC_TEMPLATE_PATH).exists():
-            final_pdf = run_docgen_inline(DOC_TEMPLATE_PATH, filled_path, src_pdf_path)
-            download_name = Path(orig_name).stem + "_filled.pdf"
-            with JOBS_LOCK:
-                JOBS[job_id].update({"status": "done", "result_path": final_pdf, "download_name": download_name})
-        else:
-            download_name = Path(orig_name).stem + "_processed.json"
-            with JOBS_LOCK:
-                JOBS[job_id].update({"status": "done", "result_path": filled_path, "download_name": download_name})
+
+        # 3) Load normalized JSON and store in memory for direct JSONResponse
+        with open(filled_path, "r", encoding="utf-8") as jf:
+            data_obj = json.load(jf)
+
+        with JOBS_LOCK:
+            JOBS[job_id].update({"status": "done", "json": data_obj})
+
     except Exception as e:
         with JOBS_LOCK:
             JOBS[job_id].update({"status": "error", "error": str(e)})
@@ -284,7 +200,7 @@ def process_job(job_id: str, src_pdf_path: str, orig_name: str):
             pass
 
 # ---------------------------
-# Routes: upload -> job_id, result polling
+# Routes
 # ---------------------------
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
@@ -295,13 +211,11 @@ async def upload(file: UploadFile = File(...), background_tasks: BackgroundTasks
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         pdf_path = tmp.name
         tmp.write(content)
-    # create job
+    # create job and start background processing
     job_id = str(uuid.uuid4())
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "queued", "result_path": None, "error": None, "download_name": None}
-    # start background processing
-    background_tasks.add_task(process_job, job_id, pdf_path, file.filename)
-    # return job id immediately
+        JOBS[job_id] = {"status": "queued", "json": None, "error": None}
+    background_tasks.add_task(process_job, job_id, pdf_path)
     return {"job_id": job_id}
 
 @app.get("/result/{job_id}")
@@ -314,10 +228,5 @@ def get_result(job_id: str):
         return {"status": job["status"]}
     if job["status"] == "error":
         return JSONResponse({"status": "error", "error": job["error"]}, status_code=500)
-    # done -> stream file
-    path = job["result_path"]
-    if not path or not Path(path).exists():
-        return JSONResponse({"status": "error", "error": "result missing"}, status_code=500)
-    # return as a file (pdf or json)
-    mime = "application/pdf" if path.endswith(".pdf") else "application/json"
-    return FileResponse(path, media_type=mime, filename=job.get("download_name") or Path(path).name)
+    # done -> return the JSON object directly
+    return JSONResponse(job["json"])
