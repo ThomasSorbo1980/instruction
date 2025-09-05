@@ -143,17 +143,36 @@ def adobe_extract_start(asset_id: str) -> str:
         raise RuntimeError(f"Extract start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
 
-def adobe_docgen_start(template_asset_id: str, data_asset_id: str) -> str:
+def adobe_docgen_start(template_asset_id: str, data_asset_id: str = None, inline_json: dict = None) -> str:
+    """
+    Start a Document Generation job.
+    You must provide either:
+      - data_asset_id (use when you've uploaded the JSON as an asset), OR
+      - inline_json (a Python dict that will be sent as "jsonData").
+    Returns the Location URL to poll.
+    """
     url = f"{ADOBE_HOST}/operation/documentgeneration"
-    body = {
-        "templateAssetID": template_asset_id,
-        "jsonDataAssetID": data_asset_id,
-        "outputFormat": "pdf",
-    }
+
+    if inline_json is not None:
+        body = {
+            "assetID": template_asset_id,
+            "jsonData": inline_json,
+            "outputFormat": "pdf"
+        }
+    elif data_asset_id is not None:
+        body = {
+            "assetID": template_asset_id,
+            "jsonDataAssetID": data_asset_id,
+            "outputFormat": "pdf"
+        }
+    else:
+        raise RuntimeError("adobe_docgen_start: provide inline_json or data_asset_id")
+
     r = requests.post(url, headers=_h_json(), json=body, timeout=60)
     if "Location" not in r.headers:
         raise RuntimeError(f"DocGen start failed: {r.status_code} {r.text}")
     return r.headers["Location"]
+
 
 def adobe_poll_job(location_url: str, interval_s=2, timeout_s=600) -> dict:
     end = time.time() + timeout_s
@@ -232,14 +251,21 @@ def run_extract(pdf_bytes: bytes, work_prefix: str) -> str:
     return str(p)
 
 def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str:
+    # 1) Upload template DOCX
     t = adobe_assets_create("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     with open(template_path, "rb") as tf:
-        adobe_put_upload(t["uploadUri"], tf.read(),
-                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        adobe_put_upload(
+            t["uploadUri"], tf.read(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+    # 2) Upload data JSON
     d = adobe_assets_create("application/json")
     with open(data_json_path, "rb") as jf:
         adobe_put_upload(d["uploadUri"], jf.read(), "application/json")
-    loc = adobe_docgen_start(t["assetID"], d["assetID"])
+
+    # 3) Start DocGen (using asset IDs) + poll
+    loc = adobe_docgen_start(template_asset_id=t["assetID"], data_asset_id=d["assetID"])
     info = adobe_poll_job(loc)
 
     pdf_url = _find_download_url(info)
@@ -253,6 +279,7 @@ def run_docgen(template_path: str, data_json_path: str, work_prefix: str) -> str
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
     return out_pdf
+
 
 # ---------------------------
 # /upload
